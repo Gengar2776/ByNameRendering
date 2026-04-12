@@ -23,7 +23,7 @@
 
 using namespace BNM::Structures::Unity;
 
-// ─── Constants ────────────────────────────────────────────────────────────────
+
 
 static constexpr int   FBO_W  = 512;
 static constexpr int   FBO_H  = 512;
@@ -32,22 +32,19 @@ static constexpr float MENU_Y = 0.1f;
 static constexpr float MENU_Z = 0.2f;
 static constexpr float MENU_S = 0.3f;
 
-// ─── Our own isolated EGL context ─────────────────────────────────────────────
+
 
 static EGLDisplay g_eglDisplay = EGL_NO_DISPLAY;
 static EGLContext g_eglContext = EGL_NO_CONTEXT;
-static EGLSurface g_eglSurface = EGL_NO_SURFACE; // pbuffer, not a window
+static EGLSurface g_eglSurface = EGL_NO_SURFACE; 
 
-// ─── GLES objects ─────────────────────────────────────────────────────────────
 
 static GLuint g_fbo = 0;
-static GLuint g_tex = 0;  // color attachment — only used internally
+static GLuint g_tex = 0;  
 
-// ─── CPU pixel buffer ─────────────────────────────────────────────────────────
 
-static std::vector<uint8_t> g_pixels; // FBO_W * FBO_H * 4 bytes
 
-// ─── Unity state ──────────────────────────────────────────────────────────────
+static std::vector<uint8_t> g_pixels; 
 
 static Texture2D* g_unityTex   = nullptr;
 static Transform* g_rightHand  = nullptr;
@@ -55,21 +52,21 @@ static Transform* g_leftHand   = nullptr;
 static Transform* g_quad       = nullptr;
 static bool       g_unityReady = false;
 
-// ─── ImGui state ──────────────────────────────────────────────────────────────
+
 
 static bool g_imguiReady = false;
 
-// ─── BNM method cache ─────────────────────────────────────────────────────────
 
-static BNM::Method<void>  g_LoadRawTextureData; // Texture2D.LoadRawTextureData(byte[], int)
-static BNM::Method<void>  g_Apply;              // Texture2D.Apply()
+
+static BNM::Method<void>  g_LoadRawTextureData; 
+static BNM::Method<void>  g_Apply;              
 static bool               g_methodsResolved = false;
 
-// ─── Input state ──────────────────────────────────────────────────────────────
+
 
 static bool g_wasTriggered = false;
 
-// ─── Math helpers ─────────────────────────────────────────────────────────────
+
 
 static float   Dot  (const Vector3& a, const Vector3& b) { return a.x*b.x + a.y*b.y + a.z*b.z; }
 static Vector3 Sub  (const Vector3& a, const Vector3& b) { return {a.x-b.x, a.y-b.y, a.z-b.z}; }
@@ -77,12 +74,7 @@ static Vector3 Add  (const Vector3& a, const Vector3& b) { return {a.x+b.x, a.y+
 static Vector3 MulF (const Vector3& v, float s)          { return {v.x*s,   v.y*s,   v.z*s};   }
 
 
-//
-//  We create a completely separate EGL context using a 1x1 pbuffer surface.
-//  This has nothing to do with Unity's Vulkan context — it's our own isolated
-//  GLES3 sandbox. We make it current only while we need to render/readback,
-//  then release it so Unity's thread is undisturbed.
-//
+
 static bool InitEGL() {
     g_eglDisplay = eglGetDisplay(EGL_DEFAULT_DISPLAY);
     if (g_eglDisplay == EGL_NO_DISPLAY) { ERR("eglGetDisplay failed"); return false; }
@@ -176,23 +168,33 @@ static void InitImGui() {
 
 
 
+static BNM::Method<Texture2D*> g_Texture2DConstructor;
+
 static bool ResolveMethods() {
     if (g_methodsResolved) return true;
 
     auto tex2DClass = BNM::Class("UnityEngine", "Texture2D",
                                  BNM::Image("UnityEngine.CoreModule.dll"));
 
-
+    g_Texture2DConstructor = tex2DClass.GetMethod(".ctor", 2);
     g_LoadRawTextureData = tex2DClass.GetMethod("LoadRawTextureData", 2);
-
     g_Apply = tex2DClass.GetMethod("Apply", 0);
 
-    if (!g_LoadRawTextureData.IsValid() || !g_Apply.IsValid()) {
-        ERR("Failed to resolve Texture2D methods");
+    if (!g_Texture2DConstructor.IsValid()) {
+        ERR("Failed to resolve Texture2D constructor");
+        return false;
+    }
+    if (!g_LoadRawTextureData.IsValid()) {
+        ERR("Failed to resolve LoadRawTextureData");
+        return false;
+    }
+    if (!g_Apply.IsValid()) {
+        ERR("Failed to resolve Apply");
         return false;
     }
 
     g_methodsResolved = true;
+    LOG("All Texture2D methods resolved successfully");
     return true;
 }
 
@@ -223,19 +225,20 @@ static bool SetupUnity() {
     }
 
 
-    // TextureFormat 4 = RGBA32
-    static BNM::Method<Texture2D*> ctor =
-            BNM::Class("UnityEngine", "Texture2D",
-                       BNM::Image("UnityEngine.CoreModule.dll"))
-                    .GetMethod(".ctor", 2); // Texture2D(int width, int height)
+    if (!g_Texture2DConstructor.IsValid()) {
+        ERR("Texture2D constructor not resolved");
+        return false;
+    }
 
-    if (!ctor.IsValid()) { ERR("Texture2D ctor not found"); return false; }
-
-    auto tex2DClass = BNM::Class("UnityEngine", "Texture2D",
-                                 BNM::Image("UnityEngine.CoreModule.dll"));
-    g_unityTex = (Texture2D*)BNM::IL2CPP::IL2CPP_VT_BLOB_OBJECT;
-    if (!g_unityTex) { ERR("CreateNewObject failsed"); return false; }
-    ctor.Call(g_unityTex, FBO_W, FBO_H);
+    // Create instance and call constructor
+    // IL2CPP objects must be allocated and constructed properly
+    // glitch recently taught me setinstance i NEVER knew this existed hes the goat
+    g_unityTex = g_Texture2DConstructor.Call(FBO_W, FBO_H);
+    if (!g_unityTex) {
+        ERR("Failed to create Texture2D instance");
+        return false;
+    }
+    LOG("Texture2D created: %dx%d at %p", FBO_W, FBO_H, g_unityTex);
 
 
     auto quadObj = GameObject::CreatePrimitive(PrimitiveType::Quad);
@@ -245,23 +248,44 @@ static bool SetupUnity() {
     if (!g_quad) { ERR("Quad transform false"); return false; }
 
     auto renderer = (Renderer*)quadObj->GetComponent(Renderer::GetType());
-    if (renderer) {
-        auto mat = renderer->GetMaterial();
-        if (mat) {
-            auto shader = Shader::Find("Unlit/Texture");
-            if (shader) mat->SetShader(shader);
-
-            static BNM::Method<void> SetMainTex =
-                    BNM::Class("UnityEngine", "Material",
-                               BNM::Image("UnityEngine.CoreModule.dll"))
-                            .GetMethod("set_mainTexture", 1);
-            if (SetMainTex.IsValid()) SetMainTex.Call(mat, g_unityTex);
-        }
+    if (!renderer) {
+        ERR("Renderer component not found on quad");
+        return false;
     }
+
+    auto mat = renderer->GetMaterial();
+    if (!mat) {
+        ERR("Failed to get material from renderer");
+        return false;
+    }
+
+    
+    auto shader = Shader::Find("Unlit/Texture");
+    if (shader) {
+        mat->SetShader(shader);
+        LOG("Shader set successfully");
+    } else {
+        ERR("Unlit/Texture shader not found, trying Standard");
+        shader = Shader::Find("Standard");
+        if (shader) mat->SetShader(shader);
+    }
+
+   
+    static BNM::Method<void> SetMainTex =
+            BNM::Class("UnityEngine", "Material",
+                       BNM::Image("UnityEngine.CoreModule.dll"))
+                    .GetMethod("set_mainTexture", 1);
+    if (!SetMainTex.IsValid()) {
+        ERR("set_mainTexture method not found");
+        return false;
+    }
+    SetMainTex.Call(mat, g_unityTex);
+    LOG("Texture assigned to material");
 
     g_quad->SetParent(g_rightHand, false);
     g_quad->SetLocalPosition({ MENU_X, MENU_Y, MENU_Z });
-    g_quad->SetLocalScale   ({ MENU_S, MENU_S, MENU_S });
+    g_quad->SetLocalScale({ MENU_S, MENU_S, MENU_S });
+    LOG("Quad positioned and scaled");
 
     LOG("Unity setup complete");
     return true;
@@ -324,7 +348,47 @@ static void RenderAndReadback() {
 
 
     ImGui::Begin("GenLauncher");
-    ImGui::Text("Gengars Imgui porn menu");
+    ImGui::Text("|----LumrGengar2776 imgui menu-----|");
+
+    ImDrawList* draw = ImGui::GetWindowDrawList();
+
+    ImVec2 pos = ImGui::GetWindowPos();
+    ImVec2 size = ImGui::GetWindowSize();
+
+
+
+
+    ImGui::Columns(2, "MainLayout", true);
+    ImGui::SetColumnWidth(0, 150);
+
+
+    ImGui::PushStyleColor(ImGuiCol_ChildBg, ImVec4(0.10f, 0.30f, 0.60f, 0.80f));
+
+    if (ImGui::BeginChild("TitleSide", ImVec2(0, -30), true))
+    {
+
+        ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(1.0f, 1.0f, 1.0f, 1.0f));
+        ImGui::TextUnformatted("lumora");
+        ImGui::TextUnformatted("Client");
+        ImGui::PopStyleColor();
+
+        ImGui::Spacing();
+        ImGui::Separator();
+        ImGui::Spacing();
+
+
+        ImGui::TextUnformatted("Categories:");
+        ImGui::Spacing();
+        ImGui::BulletText("ENTER CATERGORIES HERE");
+        ImGui::BulletText("ENTER CATERGORIES HERE");
+        ImGui::BulletText("ENTER CATERGORIES HERE");
+        ImGui::BulletText("ENTER CATERGORIES HERE");
+        ImGui::BulletText("ENTER CATERGORIES HERE");
+    }
+    ImGui::EndChild();
+    ImGui::PopStyleColor();
+
+
     ImGui::End();
 
 
@@ -351,22 +415,76 @@ static void RenderAndReadback() {
 
 
 static void UploadToUnity() {
-    if (!g_unityTex || !g_LoadRawTextureData.IsValid() || !g_Apply.IsValid()) return;
+    if (!g_unityTex) {
+        ERR("g_unityTex is null");
+        return;
+    }
+    if (!g_LoadRawTextureData.IsValid()) {
+        ERR("LoadRawTextureData method is invalid");
+        return;
+    }
+    if (!g_Apply.IsValid()) {
+        ERR("Apply method is invalid");
+        return;
+    }
 
+    
+    g_LoadRawTextureData.Call(g_unityTex, g_pixels.data(), (int)g_pixels.size());
 
-    g_LoadRawTextureData.Call(g_unityTex,
-                              g_pixels.data(),
-                              (int)g_pixels.size());
-
-
+   
     g_Apply.Call(g_unityTex);
 }
 
 
 
-void VRMenu::onupdate() {
+namespace VRMenu {
 
+void Init(JNIEnv* env, jobject activity) {
+    LOG("Init called");
+    
+}
 
+void Shutdown() {
+    LOG("Shutdown called");
+    if (g_imguiReady) {
+        ImGui_ImplOpenGL3_Shutdown();
+        ImGui::DestroyContext();
+        g_imguiReady = false;
+    }
+    
+    if (g_eglContext != EGL_NO_CONTEXT) {
+        WithOurContext([&]{
+            if (g_fbo) {
+                glDeleteFramebuffers(1, &g_fbo);
+                g_fbo = 0;
+            }
+            if (g_tex) {
+                glDeleteTextures(1, &g_tex);
+                g_tex = 0;
+            }
+        });
+        
+        if (g_eglContext != EGL_NO_CONTEXT) {
+            eglDestroyContext(g_eglDisplay, g_eglContext);
+            g_eglContext = EGL_NO_CONTEXT;
+        }
+        if (g_eglSurface != EGL_NO_SURFACE) {
+            eglDestroySurface(g_eglDisplay, g_eglSurface);
+            g_eglSurface = EGL_NO_SURFACE;
+        }
+        if (g_eglDisplay != EGL_NO_DISPLAY) {
+            eglTerminate(g_eglDisplay);
+            g_eglDisplay = EGL_NO_DISPLAY;
+        }
+    }
+    
+    g_pixels.clear();
+    g_unityReady = false;
+    g_methodsResolved = false;
+    LOG("VRMenu::Shutdown complete");
+}
+
+void onupdate() {
     if (g_eglContext == EGL_NO_CONTEXT) {
         if (!InitEGL()) return;
         bool ok = false;
@@ -375,13 +493,22 @@ void VRMenu::onupdate() {
         WithOurContext([&]{ InitImGui(); });
     }
 
-
     if (!g_unityReady) {
         g_unityReady = SetupUnity();
         if (!g_unityReady) return;
     }
 
-
     WithOurContext([&]{ RenderAndReadback(); });
     UploadToUnity();
 }
+
+GLuint GetMenuTexture() {
+    return g_unityTex ? (GLuint)(uintptr_t)g_unityTex : 0;
+}
+
+void RegisterDrawCallback(DrawCallback cb) {
+    LOG("Draw callback registered (placeholder)");
+  
+}
+
+} 
